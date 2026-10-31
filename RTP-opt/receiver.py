@@ -1,44 +1,77 @@
 import argparse
 import socket
+import sys
 
-from utils import PacketHeader, compute_checksum
+from util import PacketHeader, compute_checksum
+
+T_START, T_END, T_DATA, T_ACK = 0, 1, 2, 3
+HDR = 16
 
 
-def receiver(receiver_ip, receiver_port, window_size):
-    """TODO: Listen on socket and print received message to sys.stdout."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind((receiver_ip, receiver_port))
-    while True:
-        # Receive packet; address includes both IP and port
-        pkt, address = s.recvfrom(2048)
+def encode(kind, seq, body=b""):
+    hdr = PacketHeader(type=kind, seq_num=seq, length=len(body))
+    hdr.checksum = compute_checksum(hdr / body)
+    return bytes(hdr / body)
 
-        # Extract header and payload
-        pkt_header = PacketHeader(pkt[:16])
-        msg = pkt[16 : 16 + pkt_header.length]
 
-        # Verity checksum
-        pkt_checksum = pkt_header.checksum
-        pkt_header.checksum = 0
-        computed_checksum = compute_checksum(pkt_header / msg)
-        if pkt_checksum != computed_checksum:
-            print("checksums not match")
-        print(msg)
+def decode(raw):
+    if len(raw) < HDR:
+        return None
+    hdr = PacketHeader(raw[:HDR])
+    body = raw[HDR:HDR + hdr.length]
+    if len(body) != hdr.length:
+        return None
+    claimed = hdr.checksum
+    hdr.checksum = 0
+    if compute_checksum(hdr / body) != claimed:
+        return None
+    return hdr.type, hdr.seq_num, body
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "receiver_ip", help="The IP address of the host that receiver is running on"
-    )
-    parser.add_argument(
-        "receiver_port", type=int, help="The port number on which receiver is listening"
-    )
-    parser.add_argument(
-        "window_size", type=int, help="Maximum number of outstanding packets"
-    )
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("receiver_ip")
+    ap.add_argument("receiver_port", type=int)
+    ap.add_argument("window_size", type=int)
+    a = ap.parse_args()
 
-    receiver(args.receiver_ip, args.receiver_port, args.window_size)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((a.receiver_ip, a.receiver_port))
+    out = sys.stdout.buffer
+
+    connected = False
+    want = 1            # seq ke tiep can nhan theo thu tu
+    pending = {}        # goi den som (out-of-order)
+
+    while True:
+        raw, src = sock.recvfrom(2048)
+        msg = decode(raw)
+        if msg is None:                 # hong -> bo, khong ack
+            continue
+        kind, seq, body = msg
+
+        if kind == T_START:
+            if connected:               # dang giua ket noi -> bo qua
+                continue
+            connected, want = True, 1
+            pending.clear()
+            sock.sendto(encode(T_ACK, 1), src)
+        elif not connected:
+            continue
+        elif kind == T_DATA:
+            if seq >= want + a.window_size:     # ngoai cua so
+                continue
+            if seq >= want:
+                pending.setdefault(seq, body)
+                while want in pending:
+                    out.write(pending.pop(want))
+                    want += 1
+            sock.sendto(encode(T_ACK, seq), src)    # ack rieng tung goi
+        elif kind == T_END:
+            sock.sendto(encode(T_ACK, seq), src)
+            break
+
+    out.flush()
 
 
 if __name__ == "__main__":
